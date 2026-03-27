@@ -21,7 +21,7 @@ DEFAULT_CONFIG = {
     "model": {
         "claude": "claude-sonnet-4-20250514",
         "gpt":    "gpt-4o",
-        "gemini": "gemini-1.5-flash"
+        "gemini": "gemini-2.0-flash-lite"
     },
     "api_keys": {
         "claude": "",
@@ -159,16 +159,17 @@ def call_gpt(messages, config):
 def call_gemini(messages, config):
     key = config.get("api_keys", "gemini")
     if not key: raise ValueError("Gemini API key not set. Use /keys")
-    try:
-        from google import genai as google_genai
-    except ImportError:
-        raise ValueError("Install google-genai SDK: pip install google-genai")
     model = config.get("model", "gemini")
-    if not model.startswith("gemini"):
-        model = "gemini-2.0-flash"
-    # Build history (all but last) + current message
-    client = google_genai.Client(api_key=key)
-    # Convert to google-genai format
+    # Fallback model list — tried in order if previous fails
+    FALLBACK_MODELS = [
+        "gemini-2.0-flash-lite",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+    ]
+    if not model.startswith("gemini") or model in ("gemini-1.5-flash", "gemini-1.5-pro"):
+        model = FALLBACK_MODELS[0]
+    # Build contents — Gemini needs alternating user/model
     contents = []
     for m in messages:
         role = "user" if m["role"] == "user" else "model"
@@ -176,12 +177,39 @@ def call_gemini(messages, config):
             contents[-1]["parts"][0]["text"] += "\n" + m["content"]
         else:
             contents.append({"role": role, "parts": [{"text": m["content"]}]})
-    if contents and contents[0]["role"] != "user":
+    if not contents or contents[0]["role"] != "user":
         contents.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
-    from google.genai import types as gtypes
-    gc = [gtypes.Content(role=c["role"], parts=[gtypes.Part(text=c["parts"][0]["text"])]) for c in contents]
-    resp = client.models.generate_content(model=model, contents=gc)
-    return resp.text
+    payload = json.dumps({
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 2048, "temperature": 0.7}
+    }).encode()
+    # Try model, fallback on 503/429/404
+    models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_err = None
+    for attempt_model in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{attempt_model}:generateContent"
+        req = urllib.request.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "X-goog-api-key": key
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read())
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode()
+            try:
+                msg = json.loads(err_body).get("error", {}).get("message", err_body[:200])
+            except:
+                msg = err_body[:200]
+            last_err = f"Gemini API error {e.code} ({attempt_model}): {msg}"
+            if e.code in (503, 429, 404):
+                continue  # try next model
+            raise ValueError(last_err)
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise ValueError(f"All Gemini models failed. Last error: {last_err}")
 
 PROVIDERS = {"claude": call_claude, "gpt": call_gpt, "gemini": call_gemini}
 
