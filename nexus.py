@@ -159,18 +159,29 @@ def call_gpt(messages, config):
 def call_gemini(messages, config):
     key = config.get("api_keys", "gemini")
     if not key: raise ValueError("Gemini API key not set. Use /keys")
-    # Convert messages to Gemini format
-    parts = []
+    try:
+        from google import genai as google_genai
+    except ImportError:
+        raise ValueError("Install google-genai SDK: pip install google-genai")
+    model = config.get("model", "gemini")
+    if not model.startswith("gemini"):
+        model = "gemini-2.0-flash"
+    # Build history (all but last) + current message
+    client = google_genai.Client(api_key=key)
+    # Convert to google-genai format
+    contents = []
     for m in messages:
         role = "user" if m["role"] == "user" else "model"
-        parts.append({"role": role, "parts": [{"text": m["content"]}]})
-    payload = json.dumps({"contents": parts}).encode()
-    model = config.get("model", "gemini")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = json.loads(r.read())
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n" + m["content"]
+        else:
+            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+    if contents and contents[0]["role"] != "user":
+        contents.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
+    from google.genai import types as gtypes
+    gc = [gtypes.Content(role=c["role"], parts=[gtypes.Part(text=c["parts"][0]["text"])]) for c in contents]
+    resp = client.models.generate_content(model=model, contents=gc)
+    return resp.text
 
 PROVIDERS = {"claude": call_claude, "gpt": call_gpt, "gemini": call_gemini}
 
@@ -316,11 +327,13 @@ def text_to_command(description, session):
     """Convert natural language description to shell command using AI."""
     old_msgs = session.messages.copy()
     old_system = session.system
-    session.system = CMD_SYSTEM
-    session.messages = []
-    cmd = session.ask(description)
-    session.messages = old_msgs
-    session.system = old_system
+    try:
+        session.system = CMD_SYSTEM
+        session.messages = []
+        cmd = session.ask(description)
+    finally:
+        session.messages = old_msgs
+        session.system = old_system
     # Clean up
     cmd = cmd.strip().strip("`").strip()
     if cmd.startswith("bash\n"):
@@ -435,6 +448,21 @@ def main():
     provider = config.get("provider")
     print(f"  {DIM}Provider: {PROVIDER_COLORS[provider]}{provider.upper()}{R}  "
           f"{DIM}Model: {config.get('model', provider)}{R}")
+
+    # Warn if no API key for current provider
+    current_key = config.get("api_keys", provider)
+    if not current_key:
+        print(f"  {YELLOW}⚠  No API key for {provider.upper()}!{R}")
+        has_any = False
+        for p in PROVIDERS:
+            k = config.get("api_keys", p)
+            if k:
+                print(f"    {GREEN}✓{R} {PROVIDER_COLORS[p]}{p}{R} — has key, use: /provider {p}")
+                has_any = True
+        if not has_any:
+            print(f"  {RED}  No API keys set. Run /keys or set env vars.{R}")
+            print(f"  {CYAN}  Free Gemini key → https://aistudio.google.com/app/apikey{R}")
+        print()
     print(f"  {DIM}Type {GREEN}/help{R}{DIM} for commands. {GREEN}/keys{R}{DIM} to set API keys.{R}\n")
 
     while True:
